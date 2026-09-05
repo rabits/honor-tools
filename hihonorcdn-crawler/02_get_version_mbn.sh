@@ -20,18 +20,28 @@ worker() {
             # The filelist is not about base
             continue
         fi
+        if [ "x$fname" = 'xupdate_plugin.zip' ]; then
+            # Plugins are not needed
+            continue
+        fi
+        if [ "x$(grep -o '<packageType>full</packageType>' "${xml}")" = 'x' ]; then
+            # Skipping non-full updates
+            echo "Skipping non-full: $fname"
+            continue
+        fi
         version=$(basename "$xml" | cut -d_ -f1)
-        echo "Looking into http://update.hihonorcdn.com/TDS/data/bl/files/$version/f1/full/$fname"
         mbn_version=$(./update_zip_version_mbn.py "http://update.hihonorcdn.com/TDS/data/bl/files/$version/f1/full/$fname")
-        echo "Found version: $mbn_version"
         if [ "x$mbn_version" != 'x' ]; then
+            echo "Found version for $version: $mbn_version"
             echo "$mbn_version" > "${xml}.version_mbn"
         fi
+        sleep 3
     done
 }
 
 prev=''
 for path in "$SEARCH_DIR"/*; do
+    sleep 1.1
     worker "$path" &
 done
 
