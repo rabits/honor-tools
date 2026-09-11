@@ -65,7 +65,7 @@ HMAC/RSA on this blob.
 | actor | role |
 |---|---|
 | ABL | HIMNTN RMW; rainbow reason at +8; ABL log at `0x84000` |
-| xmntn `-h 1` | on **non-commercial** builds may rewrite HIMNTN; commercial/user skips when `factory_marker` is on |
+| xmntn `-h 1` | runs every Android boot (`post-fs-data`). On this phone (`ro.logsystem.usertype=6`, commercial) it **never writes**. Rewrite only if beta/usertype 2–5 **and** `factory_marker` is off |
 | xmntn `-r 1` | copies ramdump slices into `/data/vendor/log/reliability/dumplog/` (`xbl_abl` @ `0x80000`, `last_kmsg` @ `0x200000`, …) |
 | recovery `factory_reset` | `DoDisableHimntn` on factory reset |
 | `rainbow.ko` | `rb_header.himntn_data` in reserved RAM (`rainbow_mem@ff300000`) — RAM mirror, not NV |
@@ -324,31 +324,42 @@ boot-looping in fastboot.
 
 ---
 
-### `fastboot_gate` — item `0x0a` (10) — currently **off**
+### `battery_flash_bypass` — item `0x0a` (10) — currently **off**
 
-Used inside ABL’s fastboot dispatcher (`FUN_00052f28`) together with the
-battery-voltage warning and the `Command not allowed` ACL. The bit is
-stored inverted into an internal flag (`DAT_001d3484 = (item10 == 0)`).
-
-Exact user-visible mapping was not fully named (no oem help string). Leave
-it **off**. Flipping it can change which oem commands are accepted while
-unlocked — including making more (or fewer) commands hit `Command not
-allowed`.
+**On:** `flash`/`erase` are not rejected solely because the battery check
+failed (voltage missing, below 3200 mV, no battery). **Off (now):** those
+commands can fail with the warning above.
 
 ---
 
 ### `factory_marker` — item `0x01` (1) — currently **on**
 
-Not a cmdline token. `xmntn -h 1` (`HimntnHandle::HandleFlow`):
+This bit does **not** cause a reboot to wipe HIMNTN. It is the opposite:
+“already programmed, do not restore factory defaults.”
 
-- Commercial/user build: does not rewrite HIMNTN.
-- Non-commercial, **this bit on:** log `partition has been correct`, skip
-  write.
-- Non-commercial, **bit off:** overwrite the mask with a baked default
-  (`0x1C85F6FE00` if `ro.runmode=factory`, else `0x485B6FE00`) OR’d with
-  `0x4849400000000000`.
+`xmntn -h 1` (`HimntnHandle::HandleFlow`) starts every Android boot from
+`vendor/etc/init/xmntn.rc` at `post-fs-data` — **after** ABL has already
+read rawdump and put `HIMNTN=` on cmdline. It inspects that cmdline mask,
+not a fresh rawdump read, then:
 
-Keep it **on** so a future non-user build cannot stomp a hand-edited mask.
+1. `IsCommcialVer()`: `atoi(ro.logsystem.usertype)` not in `{2,3,4,5}` →
+   commercial (this device is **6**). Log `xmntn is commercial` and **return
+   without writing**.
+2. Else (beta): if bit 46 of the cmdline mask is set (item 1 on), log
+   `partition has been correct` and skip write.
+3. Else (beta + bit off): log `device first boot` and
+   `HimntnPartWrite` the baked default (`0x1C85F6FE00` if
+   `ro.runmode=factory`, else `0x485B6FE00`) OR’d with
+   `0x4849400000000000`. That would clobber a hand edit — on the **next**
+   reboot ABL would then apply the default. This path does not run on a
+   user/commercial build.
+
+ABL itself only **reads** HIMNTN on a normal boot (`HimntnPartitionRead`).
+`HimntnPartitionWrite` is only `fastboot oem himntn`. Recovery
+`DoDisableHimntn` is factory-reset, not every reboot.
+
+Keep item 1 **on** so a later beta/non-user build cannot stomp a
+hand-edited mask.
 
 ---
 
@@ -362,7 +373,7 @@ Keep it **on** so a future non-user build cannot stomp a hand-edited mask.
 | serial_bypass | 7 | 0 | serialno from oeminfo first |
 | maxcpus_2 | 8 | 0 | all CPUs |
 | on_failure_panic | 9 | 0 | token `OnFailurePanic` **is** on cmdline (likely unused) |
-| fastboot_gate | 10 | 0 | default ABL fastboot gating |
+| battery_flash_bypass | 10 | 0 | flash/erase vs low battery |
 | uart_earlycon | 22 | 0 | no extra UART; `console=ttynull` from DTB |
 | log_buf_len_4m | 28 | 0 | printk 1M |
 | printk_devkmsg | 29 | 1 | no `devkmsg=on`; init sets `ratelimited` anyway |

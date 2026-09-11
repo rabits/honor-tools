@@ -93,13 +93,13 @@ ITEMS: dict[str, dict] = {
         "when_off": "no OnFailurePanic token",
         "risk": "high",
     },
-    "fastboot_gate": {
+    "battery_flash_bypass": {
         "item": 10,
         "invert": False,
-        "effect": "ABL fastboot dispatcher uses this around battery/command gating",
-        "when_on": "item 10 set (DAT_001d3484 inverted in ABL)",
-        "when_off": "item 10 clear",
-        "risk": "high",
+        "effect": "ABL: skip low-battery FAIL on flash/erase only",
+        "when_on": "flash/erase proceed even if battery voltage check fails",
+        "when_off": "low battery can FAIL flash/erase with 'battery capacity is very low'",
+        "risk": "medium",
     },
     "uart_earlycon": {
         "item": 22,
@@ -302,10 +302,10 @@ def read_from_device(adb: str) -> tuple[int, int, dict[str, str]]:
             "utf-8", "replace"
         )
         extra["cmdline"] = cmdline.replace("\r", " ").strip()
-        m = re.search(r"HIMNTN=(0x[0-9A-Fa-f]+)", cmdline)
-        extra["cmdline_himntn"] = m.group(1) if m else ""
-        m = re.search(r"log_buf_len=(\S+)", cmdline)
-        extra["cmdline_log_buf_len"] = m.group(1) if m else ""
+        m = re.findall(r"HIMNTN=(0x[0-9A-Fa-f]+)", cmdline)
+        extra["cmdline_himntn"] = m[-1] if m else ""
+        m = re.findall(r"log_buf_len=(\S+)", cmdline)
+        extra["cmdline_log_buf_len"] = m[-1] if m else ""
     except RuntimeError:
         pass
     return mask, stored, extra
