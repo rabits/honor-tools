@@ -47,7 +47,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
 
-DEFAULT_PROXY = "socks5://127.0.0.1:1080"
+DEFAULT_PROXY = None
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/144.0"
 )
@@ -309,6 +309,9 @@ def apply_from_adb(args: argparse.Namespace) -> None:
         lgrp, ver = base.rsplit(" ", 1)
         args.lgrp = args.lgrp or lgrp
         args.base_version = args.base_version or ver
+    cota = adb_getprop("msc.sys.defaultcotaversion")
+    if cota:
+        args.cota_version = args.cota_version or cota
     custv = adb_getprop("ro.comp.hl.product_cust_version")
     # VER-N49-CUST 8.0.0.2(C636)
     if custv and "(" in custv:
@@ -442,28 +445,27 @@ def cmd_check(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--proxy", default=DEFAULT_PROXY, help="curl --proxy value (default: %(default)s)")
-    p.add_argument("--no-proxy", action="store_true")
     p.add_argument("--user-agent", default=DEFAULT_UA, help="UA for CDN GETs")
     p.add_argument("--check-user-agent", default="", help="UA for version/check (phone sends none)")
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--from-adb", action="store_true", help="fill model/cust/versions/serial from adb getprop")
     p.add_argument("--model", default="")
     p.add_argument("--cust", default="", help="C-version, e.g. C636")
-    p.add_argument("--vendor", default="spcseas")
-    p.add_argument("--country", default="def")
+    p.add_argument("--vendor", default="")
+    p.add_argument("--country", default="")
     p.add_argument("--device-id", default="", help="x-deviceDescId / deviceInfo.deviceId (SN)")
     p.add_argument("--udid", default="")
     p.add_argument("--board-id", default="8119")
-    p.add_argument("--lgrp", default="VER-LGRP2-OVS")
+    p.add_argument("--lgrp", default="")
     p.add_argument("--base-version", default="")
-    p.add_argument("--cust-version", default="8.0.0.2")
-    p.add_argument("--preload-version", default="8.0.0.2")
+    p.add_argument("--cust-version", default="")
+    p.add_argument("--preload-version", default="")
     p.add_argument("--patch-version", default="patch02")
-    p.add_argument("--cota-version", default="cota8.0.0")
-    p.add_argument("--platform-version", default="8.0.0")
-    p.add_argument("--software-platform", default="MagicOS_8.0.0")
-    p.add_argument("--gms-version", default="14_202401")
-    p.add_argument("--os", default="Android 14")
+    p.add_argument("--cota-version", default="")
+    p.add_argument("--platform-version", default="")
+    p.add_argument("--software-platform", default="")
+    p.add_argument("--gms-version", default="")
+    p.add_argument("--os", default="")
     p.add_argument("--language", default="en-us")
     p.add_argument("--d-version", default="D000")
     p.add_argument("--client-version", default="140100136")
@@ -487,8 +489,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.no_proxy:
-        args.proxy = ""
     if not args.check_user_agent:
         args.check_user_agent = None
     return args.func(args)
