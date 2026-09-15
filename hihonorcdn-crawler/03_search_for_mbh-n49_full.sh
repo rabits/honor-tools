@@ -1,6 +1,10 @@
 #!/bin/sh
+# Honor Magic V5 - MBH-N49
 
 SEARCH_DIR="$1"
-[ "x$SEARCH_DIR" != 'x' ] || exit 1
+if [ "x$SEARCH_DIR" = 'x' ]; then
+    echo 'Please specify directory to search in'
+    exit 1
+fi
 
 grep -r 'MBH-LGRP2-OVS' "$SEARCH_DIR" | grep 'version_mbn' | sed 's/\(.*\):\(.*\)/\2        \1/' | sort
