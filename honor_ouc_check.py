@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
-"""Honor HnOUC baseline-version check client (MagicOS 8 / HnOUC 14.1.0.136).
+"""Honor HnOUC baseline-version client (MagicOS 8 check, MagicOS 9 / Magic V5 authorize).
 
-Reconstructed from HnOUC.apk + logcat_OUC.log (VER-N49 / C636):
+Check (same host the V2 client used; V5 BlRequest still posts types 2/3/4):
 
   POST https://update.platform.hihonorcloud.com/blversion/v1/version/check
   headers: x-productId, x-deviceDescId, x-devModel, x-requestId
            Content-Type: application/json; charset=UTF-8
            Accept-Encoding: identity
   body:    commonRules + versionPackageRules + deviceInfo
-           (+ optional keyAttestation / deviceCertificate — stripped from logcat)
+           (+ keyAttestation / deviceCertificate)
 
-  CDN:     http://update.hihonorcdn.com/TDS/data/bl/files/v{id}/f1/full/filelist.xml
-           http://update.hihonorcdn.com/TDS/data/bl/files/v{id}/f1/{file}
+Authorize (HnOUC AuthHota → g2.d.e, then TokenHmac is removed before the POST):
 
+  POST https://update.platform.hihonorcloud.com/blversion/v1/version/authorize
+  body:    BlAuthParams (deviceCertificate, keyAttestation, deviceInfo,
+           blVersions, deviceToken, updateToken, versionIdList, ver)
+
+  deviceToken / updateToken / TokenHmac come from the phone:
+  android.hnouc.HnOucNative.getUpdateAuthParams()
+  The server echoes updateToken inside data=<base64>&sign=...
+  That raw body is update_auth.sa; saveUpdateAuth writes the same bytes.
+  The stock app also stores TokenHmac in oeminfo SYSTEM_UPDATE_AUTH_TOKEN.
+  This script does not invent either value.
+
+CDN: http://update.hihonorcdn.com/TDS/data/bl/files/v{id}/f1/full/filelist.xml
 update.hihonorcdn.com is WAF-gated (HTTP 567 / 514 / 403 from this network).
 Use the SOCKS5 proxy + Firefox UA that already works:
 
@@ -21,28 +32,33 @@ Use the SOCKS5 proxy + Firefox UA that already works:
 
 The check API returns the *next* hop for the current component versions, not a
 full catalog. --walk follows that chain. A live current version that has an
-update typically requires HnPKI (keyAttestation + deviceCertificate from
-ProtectAreaEx / OEMINFO); without it the server answers HTTP 401 / 101003731.
+update typically requires HnPKI; without it the server answers HTTP 401 / 101003731.
 
 Examples:
-  python3 tools/honor_ouc_check.py --from-adb
-  python3 tools/honor_ouc_check.py --from-adb --walk --filelist
-  python3 tools/honor_ouc_check.py --filelist-ids 474462,335329,335330
-  python3 tools/honor_ouc_check.py --model VER-N49 --cust C636 --base-version 8.0.0.105
+  python3 honor_ouc_check.py --from-adb
+  python3 honor_ouc_check.py --from-adb --walk --filelist \\
+    --key-attestation pki_honor_magic_v5/key_attestation.txt \\
+    --device-certificate pki_honor_magic_v5/device_certificate.txt
 
-  # After dumping HnPKI with zygote-CVE-2024-31317 --dump-pki:
-  python3 tools/honor_ouc_check.py --from-adb \
-    --key-attestation pki/key_attestation.txt \
-    --device-certificate pki/device_certificate.txt --walk --filelist
+  # Next-hop packages from the check, tokens from the phone, .sa via JNI:
+  python3 honor_ouc_check.py --from-adb --authorize --auth-target 10.0.0.122 --pull-auth-params \\
+    --key-attestation pki_honor_magic_v5/key_attestation.txt \\
+    --device-certificate pki_honor_magic_v5/device_certificate.txt \\
+    --auth-out pki_honor_magic_v5/auth_out
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
+import re
 import os
+import stat
 import subprocess
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -52,8 +68,25 @@ DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/144.0"
 )
 CHECK_URL = "https://update.platform.hihonorcloud.com/blversion/v1/version/check"
+AUTHORIZE_URL = "https://update.platform.hihonorcloud.com/blversion/v1/version/authorize"
 CDN_HOST = "http://update.hihonorcdn.com"
 CDN_PREFIX = "/TDS/data/bl/files"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTH_JAVA = os.path.join(SCRIPT_DIR, "HnOucAuth.java")
+PHONE_DEX = "/data/local/tmp/hnouc_auth.dex"
+
+BL_INFO_KEYS = (
+    "blVersionType",
+    "laneId",
+    "laneName",
+    "currentBlVersionId",
+    "currentBlVersionNumber",
+    "targetBlVersionId",
+    "targetBlVersionNumber",
+    "updateAction",
+    "targetCowCompressControl",
+)
+PKG_KEYS = ("versionId", "versionPackageType", "packageIndex")
 
 PACKAGE_TYPE = {
     2: "base",
@@ -132,12 +165,29 @@ def fingerprint(model: str, incremental: str) -> str:
     return f"HONOR/{model}/HNVER:14/HONOR{model}/{incremental}:user/release-keys"
 
 
+def version_number(explicit: str, fallback: str) -> str:
+    return explicit or fallback
+
+
 def build_check_body(args: argparse.Namespace) -> dict[str, Any]:
     incremental = f"{args.base_version}{args.cust}E2R2P2"
+    base_number = version_number(
+        getattr(args, "base_version_number", ""),
+        f"{args.lgrp} {args.base_version}".strip(),
+    )
+    cust_number = version_number(
+        getattr(args, "cust_version_number", ""),
+        f"{args.model}-CUST {args.cust_version}({args.cust})",
+    )
+    preload_number = version_number(
+        getattr(args, "preload_version_number", ""),
+        f"{args.model}-PRELOAD {args.preload_version}({args.cust}R2)",
+    )
+    finger = args.fingerprint or fingerprint(args.model, incremental)
     rules: list[dict[str, Any]] = [
-        {"versionPackageType": 2, "versionNumber": f"{args.lgrp} {args.base_version}"},
-        {"versionPackageType": 3, "versionNumber": f"{args.model}-CUST {args.cust_version}({args.cust})"},
-        {"versionPackageType": 4, "versionNumber": f"{args.model}-PRELOAD {args.preload_version}({args.cust}R2)"},
+        {"versionPackageType": 2, "versionNumber": base_number},
+        {"versionPackageType": 3, "versionNumber": cust_number},
+        {"versionPackageType": 4, "versionNumber": preload_number},
     ]
     if args.patch_version:
         rules.append({"versionPackageType": 13, "versionNumber": args.patch_version})
@@ -159,8 +209,10 @@ def build_check_body(args: argparse.Namespace) -> dict[str, Any]:
             "clientType": "hnouc",
             "clientVersion": args.client_version,
             "dVersion": args.d_version,
+            "cVersion": args.c_version or args.cust,
+            "currentTime": int(time.time() * 1000),
             "devModel": args.model,
-            "fingerPrint": fingerprint(args.model, incremental),
+            "fingerPrint": finger,
             "language": args.language,
             "os": args.os,
             "subGroup": "",
@@ -170,7 +222,7 @@ def build_check_body(args: argparse.Namespace) -> dict[str, Any]:
                 args.vendor, args.country, args.software_platform,
                 args.ram, args.emmc, args.cpu, args.client_name,
             ),
-            "vendorCountry": f"{args.country}_{args.vendor}",
+            "vendorCountry": args.vendor_country or f"{args.country}_{args.vendor}",
             "boardID": args.board_id,
             "softwarePlatform": args.software_platform,
             "usageInfo": "error",
@@ -299,40 +351,171 @@ def summarize_check(resp: dict[str, Any]) -> tuple[list[dict[str, Any]], list[di
     return hops, versions
 
 
+def adb_shell(command: str, *, root: bool = False, timeout: int = 20) -> str:
+    if root:
+        argv = ["adb", "exec-out", "su", "-c", command]
+    else:
+        argv = ["adb", "shell", command]
+    r = subprocess.run(argv, capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(err or f"adb failed ({command})")
+    return r.stdout.decode("utf-8", "replace")
+
+
+def package_versions(package: str) -> tuple[str, str]:
+    text = adb_shell(f"dumpsys package {package}")
+    code = ""
+    name = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("versionCode=") and not code:
+            code = stripped.split("=", 1)[1].split()[0]
+        elif stripped.startswith("versionName=") and not name:
+            name = stripped.split("=", 1)[1].strip()
+        if code and name:
+            break
+    return code, name
+
+
+def prop_prefer(*names: str) -> str:
+    for name in names:
+        value = adb_getprop(name)
+        if value:
+            return value
+    return ""
+
+
 def apply_from_adb(args: argparse.Namespace) -> None:
     args.model = args.model or adb_getprop("ro.product.model")
-    args.cust = args.cust or adb_getprop("ro.product.CustCVersion")
+    args.cust = args.cust or prop_prefer("ro.magic.cversion", "ro.product.CustCVersion")
+    args.c_version = args.c_version or args.cust
     args.device_id = args.device_id or adb_getprop("ro.serialno")
-    args.board_id = args.board_id or adb_getprop("ro.board.boardid")
-    base = adb_getprop("ro.comp.hl.product_base_version")
-    if base and " " in base:
-        lgrp, ver = base.rsplit(" ", 1)
-        args.lgrp = args.lgrp or lgrp
-        args.base_version = args.base_version or ver
+    live_board = adb_getprop("ro.board.boardid")
+    if live_board and args.board_id in ("", "8119"):
+        args.board_id = live_board
+    args.fingerprint = args.fingerprint or adb_getprop("ro.build.fingerprint")
+    base = prop_prefer(
+        "ro.comp.hl.product_base_version.real",
+        "ro.comp.hl.product_base_version",
+    )
+    if base:
+        args.base_version_number = args.base_version_number or base
+        if " " in base:
+            lgrp, ver = base.rsplit(" ", 1)
+            args.lgrp = args.lgrp or lgrp
+            args.base_version = args.base_version or ver
     cota = adb_getprop("msc.sys.defaultcotaversion")
     if cota:
         args.cota_version = args.cota_version or cota
-    custv = adb_getprop("ro.comp.hl.product_cust_version")
-    # VER-N49-CUST 8.0.0.2(C636)
-    if custv and "(" in custv:
-        left, _ = custv.split("(", 1)
-        args.cust_version = args.cust_version or left.rsplit(" ", 1)[-1]
-    pre = adb_getprop("ro.comp.hl.product_preload_version")
-    if pre and "(" in pre:
-        left, _ = pre.split("(", 1)
-        args.preload_version = args.preload_version or left.rsplit(" ", 1)[-1]
+    custv = prop_prefer(
+        "ro.comp.hl.product_cust_version.real",
+        "ro.comp.hl.product_cust_version",
+    )
+    if custv:
+        args.cust_version_number = args.cust_version_number or custv
+        if "(" in custv:
+            left, _ = custv.split("(", 1)
+            args.cust_version = args.cust_version or left.rsplit(" ", 1)[-1]
+    pre = prop_prefer(
+        "ro.comp.hl.product_preload_version.real",
+        "ro.comp.hl.product_preload_version",
+    )
+    if pre:
+        args.preload_version_number = args.preload_version_number or pre
+        if "(" in pre:
+            left, _ = pre.split("(", 1)
+            args.preload_version = args.preload_version or left.rsplit(" ", 1)[-1]
     plat = adb_getprop("ro.build.version.magic")
     if plat:
         args.software_platform = args.software_platform or plat
         if plat.startswith("MagicOS_"):
             args.platform_version = args.platform_version or plat.split("_", 1)[1]
     args.gms_version = args.gms_version or adb_getprop("ro.com.google.gmsversion")
-    vendorcountry = adb_getprop("ro.boot.vendorcountry") or adb_getprop("ro.product.VendorCountry")
-    if "/" in vendorcountry:
-        country, vendor = vendorcountry.split("/", 1)
-        args.country = args.country or country
+    custom = ""
+    try:
+        custom = adb_shell("head -n 1 /data/custom.bin", root=True).strip().splitlines()[0].strip()
+    except (RuntimeError, subprocess.TimeoutExpired, IndexError):
+        custom = ""
+    if "/" in custom:
+        # /data/custom.bin is vendor/country. The check body keeps that order,
+        # with '/' replaced by '_': def/eea → def_eea.
+        vendor, country = custom.split("/", 1)
         args.vendor = args.vendor or vendor
+        args.country = args.country or country
+        args.vendor_country = args.vendor_country or custom.replace("/", "_")
+    else:
+        vendorcountry = adb_getprop("ro.boot.vendorcountry") or adb_getprop("ro.product.VendorCountry")
+        if "/" in vendorcountry:
+            country, vendor = vendorcountry.split("/", 1)
+            args.country = args.country or country
+            args.vendor = args.vendor or vendor
+            args.vendor_country = args.vendor_country or f"{args.country}_{args.vendor}"
     args.os = args.os or f"Android {adb_getprop('ro.build.version.release')}"
+    if args.patch_version == "patch00":
+        try:
+            patch_prop = adb_shell("cat /patch_hn/patch.prop", root=True)
+        except (RuntimeError, subprocess.TimeoutExpired):
+            patch_prop = ""
+        for line in patch_prop.splitlines():
+            if line.startswith("ro.patchversion="):
+                args.patch_version = line.split("=", 1)[1].strip() or "patch00"
+                break
+    try:
+        code, name = package_versions("com.hihonor.ouc")
+    except (RuntimeError, subprocess.TimeoutExpired):
+        code, name = "", ""
+    if code:
+        args.client_version = code if args.client_version == "140100136" else args.client_version
+    if name:
+        args.client_name = name if args.client_name == "14.1.0.136" else args.client_name
+
+
+def hop_component(hop: dict[str, Any], package_type: int) -> str:
+    for comp in hop.get("components") or []:
+        if comp.get("versionPackageType") == package_type:
+            return str(comp.get("versionNumber") or "")
+    return ""
+
+
+def installed_key(args: argparse.Namespace) -> tuple[str, str, str, str]:
+    return (
+        getattr(args, "base_version_number", "") or f"{args.lgrp} {args.base_version}".strip(),
+        getattr(args, "cust_version_number", ""),
+        getattr(args, "preload_version_number", ""),
+        args.patch_version,
+    )
+
+
+def full_hop_state(args: argparse.Namespace, hop: dict[str, Any]) -> dict[str, str] | None:
+    """Next check position is the type-1 target of every component, not base alone."""
+    if hop.get("blVersionType") not in (1, None):
+        return None
+    if hop.get("status") not in (0, "0", None):
+        return None
+    base = hop_component(hop, 2)
+    if not base:
+        return None
+    return {
+        "base_version_number": base,
+        "base_version": base.rsplit(" ", 1)[-1],
+        "lgrp": base.rsplit(" ", 1)[0] if " " in base else args.lgrp,
+        "cust_version_number": hop_component(hop, 3) or getattr(args, "cust_version_number", ""),
+        "preload_version_number": hop_component(hop, 4) or getattr(args, "preload_version_number", ""),
+        "patch_version": args.patch_version,
+    }
+
+
+def apply_installed(args: argparse.Namespace, state: dict[str, str]) -> None:
+    old_base = args.base_version
+    args.base_version_number = state["base_version_number"]
+    args.base_version = state["base_version"]
+    args.lgrp = state["lgrp"]
+    args.cust_version_number = state["cust_version_number"]
+    args.preload_version_number = state["preload_version_number"]
+    args.patch_version = state["patch_version"]
+    if args.fingerprint and old_base and old_base != args.base_version and old_base in args.fingerprint:
+        args.fingerprint = args.fingerprint.replace(old_base, args.base_version, 1)
 
 
 def print_json(obj: Any) -> None:
@@ -340,10 +523,315 @@ def print_json(obj: Any) -> None:
     sys.stdout.write("\n")
 
 
+def write_private(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def version_mentioned(text: str, needle: str) -> bool:
+    if not needle:
+        return False
+    if needle.startswith("patch"):
+        return needle in text
+    return re.search(rf"(?<![\d.]){re.escape(needle)}(?![\d.])", text) is not None
+
+
+def check_item_text(item: dict[str, Any]) -> str:
+    info = item.get("blVersionInfo") if isinstance(item.get("blVersionInfo"), dict) else {}
+    parts = [
+        info.get("targetBlVersionNumber"),
+        info.get("currentBlVersionNumber"),
+        item.get("target"),
+        item.get("current"),
+    ]
+    for comp in (item.get("targetBlComponents") or item.get("components") or []):
+        if isinstance(comp, dict):
+            parts.append(comp.get("versionNumber"))
+            parts.append(comp.get("displayVersionNumber"))
+    return " ".join(str(part) for part in parts if part)
+
+
+def narrow_check(resp: dict[str, Any], target: str) -> dict[str, Any] | None:
+    result = resp.get("result")
+    if not isinstance(result, dict):
+        return None
+    kept = []
+    for item in result.get("blVersionCheckResults") or []:
+        if not isinstance(item, dict) or not version_mentioned(check_item_text(item), target):
+            continue
+        if not target.startswith("patch") and item.get("blVersionType") not in (1, None):
+            continue
+        kept.append(item)
+    if not kept:
+        return None
+    narrowed = json.loads(json.dumps(resp))
+    narrowed["result"]["blVersionCheckResults"] = kept
+    return narrowed
+
+
+def check_for_target(report: dict[str, Any], target: str) -> dict[str, Any]:
+    if not target:
+        return report.get("check") or {}
+    sources = [report.get("check") or {}]
+    sources.extend(step.get("check") or {} for step in report.get("walk") or [])
+    for source in sources:
+        narrowed = narrow_check(source, target)
+        if narrowed is not None:
+            return narrowed
+    raise RuntimeError(
+        f"no check hop offers {target}. The server only returns the next hop "
+        "from the installed versions, then from each previous target."
+    )
+
+
+def bl_versions_from_check(
+    resp: dict[str, Any], only_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    result = resp.get("result") if isinstance(resp.get("result"), dict) else resp
+    items = result.get("blVersionCheckResults") or []
+    wanted = [x for x in only_ids if x]
+    versions: list[dict[str, Any]] = []
+    ids: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("blVersionInfo") if isinstance(item.get("blVersionInfo"), dict) else {}
+        packages = item.get("updatePackages") or []
+        kept: list[dict[str, Any]] = []
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                continue
+            vid = str(pkg.get("versionId") or "")
+            if not vid or (wanted and vid not in wanted):
+                continue
+            entry = {k: pkg[k] for k in PKG_KEYS if k in pkg}
+            entry["versionId"] = vid
+            kept.append(entry)
+            if vid not in ids:
+                ids.append(vid)
+        if wanted and not kept:
+            continue
+        if not info and not kept:
+            continue
+        block: dict[str, Any] = {}
+        if info:
+            block["blVersionInfo"] = {k: info[k] for k in BL_INFO_KEYS if k in info}
+        if kept:
+            block["updatePackages"] = kept
+        versions.append(block)
+    for vid in wanted:
+        if vid not in ids:
+            ids.append(vid)
+    return versions, ids
+
+
+def build_authorize_body(
+    args: argparse.Namespace,
+    auth_params: dict[str, str],
+    version_ids: list[str],
+    bl_versions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if args.udid:
+        info_id = args.udid
+        ver = "2"
+    else:
+        info_id = args.imei or args.device_id
+        ver = "1"
+    body: dict[str, Any] = {
+        "deviceInfo": {"deviceId": info_id},
+        "deviceToken": auth_params["deviceId"],
+        "updateToken": auth_params["updateToken"],
+        "versionIdList": version_ids,
+        "ver": ver,
+    }
+    if bl_versions:
+        body["blVersions"] = bl_versions
+    if args.key_attestation:
+        body["keyAttestation"] = PathText(args.key_attestation)
+    if args.device_certificate:
+        body["deviceCertificate"] = PathText(args.device_certificate)
+    return body
+
+
+def decode_auth_payload(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("data="):
+        chunk = text.split("&", 1)[0][5:]
+        decoded = base64.b64decode(chunk)
+        parsed = json.loads(decoded.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {"_value": parsed}
+    parsed = json.loads(text or "{}")
+    return parsed if isinstance(parsed, dict) else {"_value": parsed}
+
+
+def find_d8() -> str | None:
+    roots = [
+        os.environ.get("ANDROID_SDK_ROOT", ""),
+        os.environ.get("ANDROID_HOME", ""),
+        "/opt/android/sdk",
+    ]
+    for root in roots:
+        tools = os.path.join(root, "build-tools")
+        if not os.path.isdir(tools):
+            continue
+        versions = sorted(os.listdir(tools), reverse=True)
+        for version in versions:
+            path = os.path.join(tools, version, "d8")
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
+def ensure_auth_dex() -> str:
+    dex_path = os.path.join(SCRIPT_DIR, "hnouc_auth.dex")
+    java_mtime = os.path.getmtime(AUTH_JAVA)
+    if os.path.isfile(dex_path) and os.path.getmtime(dex_path) >= java_mtime:
+        return dex_path
+    d8 = find_d8()
+    if not d8:
+        raise RuntimeError("d8 not found under ANDROID_SDK_ROOT or /opt/android/sdk/build-tools")
+    work = os.path.join(SCRIPT_DIR, ".hnouc_auth_build")
+    os.makedirs(work, exist_ok=True)
+    javac = subprocess.run(
+        ["javac", "--release", "8", "-d", work, AUTH_JAVA],
+        capture_output=True,
+        text=True,
+    )
+    if javac.returncode != 0:
+        raise RuntimeError(javac.stderr.strip() or "javac failed")
+    class_file = os.path.join(work, "HnOucAuth.class")
+    packed = subprocess.run(
+        [d8, "--output", work, class_file],
+        capture_output=True,
+        text=True,
+    )
+    if packed.returncode != 0:
+        raise RuntimeError(packed.stderr.strip() or "d8 failed")
+    built = os.path.join(work, "classes.dex")
+    os.replace(built, dex_path)
+    return dex_path
+
+
+def adb_push(local: str, remote: str) -> None:
+    r = subprocess.run(["adb", "push", local, remote], capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip() or f"adb push {remote} failed")
+
+
+def phone_auth_main(dex_remote: str, *args: str) -> str:
+    quoted = " ".join("'" + a.replace("'", "'\\''") + "'" for a in args)
+    command = (
+        f"CLASSPATH={dex_remote} app_process /system/bin HnOucAuth {quoted}"
+    )
+    return adb_shell(command, root=True, timeout=60)
+
+
+def parse_phone_json(text: str) -> dict[str, Any]:
+    start = text.find("JSON ")
+    if start < 0:
+        raise RuntimeError(f"phone did not return auth params: {text.strip()[:400]}")
+    parsed, _ = json.JSONDecoder().raw_decode(text[start + 5:].lstrip())
+    if not isinstance(parsed, dict):
+        raise RuntimeError("getUpdateAuthParams did not return a JSON object")
+    return parsed
+
+
+def load_auth_params(args: argparse.Namespace) -> dict[str, str]:
+    if args.pull_auth_params:
+        dex = ensure_auth_dex()
+        adb_push(dex, PHONE_DEX)
+        text = phone_auth_main(PHONE_DEX, "dump")
+        parsed = parse_phone_json(text)
+        missing = [k for k in ("deviceId", "updateToken", "TokenHmac") if not parsed.get(k)]
+        if missing:
+            raise RuntimeError(f"getUpdateAuthParams missing {', '.join(missing)}")
+        if args.auth_params:
+            write_private(
+                args.auth_params,
+                json.dumps(
+                    {k: parsed[k] for k in ("deviceId", "updateToken", "TokenHmac")},
+                    separators=(",", ":"),
+                ).encode(),
+            )
+        return {k: str(parsed[k]) for k in ("deviceId", "updateToken", "TokenHmac")}
+    if not args.auth_params:
+        raise RuntimeError("authorize needs --auth-params or --pull-auth-params")
+    with open(args.auth_params, "r", encoding="utf-8") as f:
+        parsed = json.load(f)
+    missing = [k for k in ("deviceId", "updateToken", "TokenHmac") if not parsed.get(k)]
+    if missing:
+        raise RuntimeError(f"{args.auth_params} missing {', '.join(missing)}")
+    return {k: str(parsed[k]) for k in ("deviceId", "updateToken", "TokenHmac")}
+
+
+def cmd_authorize(args: argparse.Namespace, check_resp: dict[str, Any]) -> dict[str, Any]:
+    only_ids = [x.strip() for x in (args.auth_version_ids or "").split(",") if x.strip()]
+    bl_versions, version_ids = bl_versions_from_check(check_resp, only_ids)
+    if not version_ids:
+        raise RuntimeError(
+            "check response has no updatePackages versionId; "
+            "pass --auth-version-ids or a --check-file from a hop that offers packages"
+        )
+    auth_params = load_auth_params(args)
+    body = build_authorize_body(args, auth_params, version_ids, bl_versions)
+    out_dir = args.auth_out or os.path.join(SCRIPT_DIR, "auth_out")
+    os.makedirs(out_dir, exist_ok=True)
+    request_path = os.path.join(out_dir, "authorize_request.json")
+    write_private(request_path, json.dumps(body, separators=(",", ":")).encode())
+    status, raw = curl(
+        AUTHORIZE_URL,
+        method="POST",
+        headers=check_headers(args),
+        data=json.dumps(body, separators=(",", ":")).encode(),
+        proxy=args.proxy,
+        timeout=args.timeout,
+        user_agent=args.check_user_agent,
+    )
+    response_path = os.path.join(out_dir, "authorize_response.txt")
+    write_private(response_path, raw)
+    sa_path = os.path.join(out_dir, "update_auth.sa")
+    if status == 200 and raw:
+        write_private(sa_path, raw)
+    report: dict[str, Any] = {
+        "authorizeHttp": status,
+        "authorizeUrl": AUTHORIZE_URL,
+        "versionIds": version_ids,
+        "requestFile": request_path,
+        "responseFile": response_path,
+    }
+    if status == 200 and raw:
+        report["updateAuthSa"] = sa_path
+    text = raw.decode("utf-8", "replace")
+    try:
+        payload = decode_auth_payload(text)
+    except (json.JSONDecodeError, ValueError, binascii.Error):
+        payload = {}
+        report["decodeError"] = True
+    approved = []
+    for item in payload.get("approvedVersionList") or []:
+        if isinstance(item, dict):
+            status_value = item.get("status")
+            approved.append(
+                {
+                    "versionId": str(item.get("versionId") or ""),
+                    "status": "" if status_value is None else str(status_value),
+                }
+            )
+    if approved:
+        report["approvedVersionList"] = approved
+    if payload.get("updateToken"):
+        report["updateTokenMatch"] = payload.get("updateToken") == auth_params["updateToken"]
+    return report
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     if args.from_adb:
         apply_from_adb(args)
-    if not args.filelist_ids_only:
+    if not args.filelist_ids_only and not args.check_file:
         missing = [n for n in ("model", "cust", "device_id", "base_version") if not getattr(args, n)]
         if missing:
             print(
@@ -356,18 +844,28 @@ def cmd_check(args: argparse.Namespace) -> int:
         "device": {
             "model": args.model,
             "cust": args.cust,
-            "vendorCountry": f"{args.country}_{args.vendor}",
+            "vendorCountry": args.vendor_country or f"{args.country}_{args.vendor}",
+            "boardID": args.board_id,
             "deviceId": args.device_id,
-            "base": f"{args.lgrp} {args.base_version}",
-            "custPkg": f"{args.model}-CUST {args.cust_version}({args.cust})",
-            "preloadPkg": f"{args.model}-PRELOAD {args.preload_version}({args.cust}R2)",
+            "fingerprint": args.fingerprint,
+            "clientVersion": args.client_version,
+            "base": getattr(args, "base_version_number", "") or f"{args.lgrp} {args.base_version}".strip(),
+            "custPkg": getattr(args, "cust_version_number", "")
+            or f"{args.model}-CUST {args.cust_version}({args.cust})",
+            "preloadPkg": getattr(args, "preload_version_number", "")
+            or f"{args.model}-PRELOAD {args.preload_version}({args.cust}R2)",
         },
         "hops": [],
         "packages": [],
         "filelists": [],
     }
 
-    if not args.filelist_ids_only:
+    if args.check_file:
+        with open(args.check_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        report["checkHttp"] = saved.get("checkHttp", 200) if "check" in saved else 200
+        report["check"] = saved.get("check", saved)
+    elif not args.filelist_ids_only:
         body = build_check_body(args)
         if args.dump_request:
             print_json({"url": CHECK_URL, "headers": check_headers(args), "body": body})
@@ -384,10 +882,14 @@ def cmd_check(args: argparse.Namespace) -> int:
                 "from OEMINFO KEY_ATTESTATION / DEVICE_CERTIFICATE1."
             )
         ids = []
+        description_ids = set()
         for v in version_list:
             vid = str(v.get("versionId") or "")
+            number = str(v.get("versionNumber") or "")
             if vid:
                 ids.append(vid)
+            if vid and number.isdigit():
+                description_ids.add(vid)
             report["packages"].append(
                 {
                     "versionId": vid,
@@ -400,35 +902,72 @@ def cmd_check(args: argparse.Namespace) -> int:
                 vid = str(pkg.get("versionId") or "")
                 if vid and vid not in ids:
                     ids.append(vid)
-            desc = hop.get("descriptPackageId")
-            if desc and str(desc) not in ids:
-                ids.append(str(desc))
+            desc = str(hop.get("descriptPackageId") or "")
+            if desc:
+                description_ids.add(desc)
+                if desc not in ids:
+                    ids.append(desc)
         if args.filelist:
             for vid in ids:
+                if vid in description_ids:
+                    continue
                 report["filelists"].append(fetch_filelist(args, vid))
 
-        if args.walk and hops:
-            current = args.base_version
-            seen = {current}
-            for hop in hops:
-                target = hop.get("target") or ""
-                # VER-N49 8.0.0.142(C636E2R2P2) → 8.0.0.142
-                num = None
-                if target:
-                    parts = target.replace("(", " ").split()
-                    for p in parts:
-                        if p.count(".") >= 2:
-                            num = p
-                            break
-                if not num or num in seen:
-                    continue
-                seen.add(num)
-                args.base_version = num
-                body = build_check_body(args)
-                http, resp = version_check(args, body)
-                more_hops, more_vers = summarize_check(resp)
-                report.setdefault("walk", []).append({"from": num, "http": http, "hops": more_hops, "check": resp})
-                if http != 200:
+        target_already_offered = bool(args.auth_target) and narrow_check(resp, args.auth_target) is not None
+        if (args.walk or (args.auth_target and not target_already_offered)) and hops:
+            seen = {installed_key(args)}
+            frontier = hops
+            while frontier and len(report.setdefault("walk", [])) < 8:
+                advanced = False
+                for hop in frontier:
+                    state = full_hop_state(args, hop)
+                    if state is None:
+                        continue
+                    key = (
+                        state["base_version_number"],
+                        state["cust_version_number"],
+                        state["preload_version_number"],
+                        state["patch_version"],
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    apply_installed(args, state)
+                    body = build_check_body(args)
+                    http, resp = version_check(args, body)
+                    more_hops, more_vers = summarize_check(resp)
+                    report["walk"].append(
+                        {
+                            "from": {
+                                "base": state["base_version_number"],
+                                "cust": state["cust_version_number"],
+                                "preload": state["preload_version_number"],
+                                "patch": state["patch_version"],
+                            },
+                            "http": http,
+                            "errCode": resp.get("errCode"),
+                            "hops": more_hops,
+                            "check": resp,
+                        }
+                    )
+                    if args.filelist:
+                        have = {f.get("versionId") for f in report["filelists"]}
+                        for v in more_vers:
+                            vid = str(v.get("versionId") or "")
+                            number = str(v.get("versionNumber") or "")
+                            if not vid or vid in have or number.isdigit():
+                                continue
+                            report["filelists"].append(fetch_filelist(args, vid))
+                            have.add(vid)
+                    if http != 200 or resp.get("status") not in (0, "0", None):
+                        frontier = []
+                    elif args.auth_target and not args.walk and narrow_check(resp, args.auth_target):
+                        frontier = []
+                    else:
+                        frontier = more_hops
+                    advanced = True
+                    break
+                if not advanced:
                     break
 
     extra_ids = [x.strip() for x in (args.filelist_ids or "").split(",") if x.strip()]
@@ -439,7 +978,20 @@ def cmd_check(args: argparse.Namespace) -> int:
                 report["filelists"].append(fetch_filelist(args, vid))
 
     print_json(report)
-    return 0 if report.get("checkHttp", 200) in (200, None) else 1
+    if not args.authorize:
+        return 0 if report.get("checkHttp", 200) in (200, None) else 1
+    if report.get("checkHttp", 200) not in (200, None):
+        print("authorize skipped: version/check did not return HTTP 200", file=sys.stderr)
+        return 1
+    try:
+        auth_report = cmd_authorize(args, check_for_target(report, args.auth_target))
+    except (RuntimeError, json.JSONDecodeError, OSError, subprocess.TimeoutExpired) as exc:
+        print(f"authorize failed: {exc}", file=sys.stderr)
+        return 1
+    print_json(auth_report)
+    approved = auth_report.get("approvedVersionList") or []
+    approved_ok = bool(approved) and all(item.get("status") == "0" for item in approved)
+    return 0 if auth_report.get("authorizeHttp") == 200 and auth_report.get("updateTokenMatch") is True and approved_ok else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -453,14 +1005,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cust", default="", help="C-version, e.g. C636")
     p.add_argument("--vendor", default="")
     p.add_argument("--country", default="")
-    p.add_argument("--device-id", default="", help="x-deviceDescId / deviceInfo.deviceId (SN)")
-    p.add_argument("--udid", default="")
+    p.add_argument("--vendor-country", default="", help="commonRules.vendorCountry; --from-adb reads /data/custom.bin")
+    p.add_argument("--device-id", default="", help="serial; used as deviceInfo.deviceId when udid/imei are empty")
+    p.add_argument("--udid", default="", help="when set, authorize ver=2 and deviceInfo.deviceId is the udid")
+    p.add_argument("--imei", default="", help="deviceInfo.deviceId when udid is empty")
+    p.add_argument("--fingerprint", default="", help="commonRules.fingerPrint; --from-adb reads ro.build.fingerprint")
+    p.add_argument("--c-version", default="", help="commonRules.cVersion; defaults to --cust")
     p.add_argument("--board-id", default="8119")
     p.add_argument("--lgrp", default="")
     p.add_argument("--base-version", default="")
+    p.add_argument("--base-version-number", default="", help="type 2 versionNumber; --from-adb uses the raw property")
     p.add_argument("--cust-version", default="")
+    p.add_argument("--cust-version-number", default="", help="type 3 versionNumber; --from-adb uses the raw property")
     p.add_argument("--preload-version", default="")
-    p.add_argument("--patch-version", default="patch02")
+    p.add_argument("--preload-version-number", default="", help="type 4 versionNumber; --from-adb uses the raw property")
+    p.add_argument("--patch-version", default="patch00", help="wire type 13; V5 sends patch00 when /patch_hn/patch.prop is absent")
     p.add_argument("--cota-version", default="")
     p.add_argument("--platform-version", default="")
     p.add_argument("--software-platform", default="")
@@ -483,6 +1042,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--filelist-ids-only", action="store_true", help="skip version/check, only fetch --filelist-ids")
     p.add_argument("--walk", action="store_true", help="re-check using each target as the new current base")
     p.add_argument("--dump-request", action="store_true")
+    p.add_argument("--check-file", default="", help="saved version/check JSON, or a previous script report")
+    p.add_argument("--authorize", action="store_true", help="POST /blversion/v1/version/authorize for the check hop")
+    p.add_argument("--auth-target", default="", help="OTA version to authorize, e.g. 10.0.0.122 or patch01")
+    p.add_argument("--auth-params", default="", help="JSON with deviceId, updateToken, TokenHmac from the phone")
+    p.add_argument("--pull-auth-params", action="store_true", help="call HnOucNative.getUpdateAuthParams on the phone")
+    p.add_argument("--auth-version-ids", default="", help="comma-separated versionIds; default is every id in the check hop")
+    p.add_argument("--auth-out", default="", help="directory for the request, raw response, and update_auth.sa")
     p.set_defaults(func=cmd_check)
     return p
 

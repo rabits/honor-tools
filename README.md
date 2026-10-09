@@ -38,7 +38,7 @@ I got my PKI via zygote-injection available on 8.0.0.105 - setting com.hihonor.o
 can communicate by `com.hihonor.android.os.ProtectAreaEx.readProtectArea` and dump the data from
 oeminfo.
 
-WARNING: Applicable to Honor Magic V2 8.0.0.105
+WARNING: Applicable to Honor Magic V2 8.0.0.105 and Honor Magic V5 9.0.1.160
 
 Details: [[honor_ouc_check.md]]
 
@@ -64,3 +64,17 @@ WARNING: Was checked only on Honor Magic V5 9.0.1.160
 WARNING: Requires at least runtime root for execution (for example via https://github.com/YuKongA/ghostlock-app)
 
 Details: [[himntn_rawdump_root.md]]
+
+## oeminfo_tool.py
+
+Tool for parsing, packing, and managing HUAWEI/HONOR OEMINFO image file. Could be found on device
+in `/dev/block/by-name/oeminfo` and contains very useful data, for example:
+
+* DEBUG_LOCK_POLICY - stores security status of the device (SAFE/RISK) and could be easily modified
+to return SAFE status back in place without factory reset.
+* DEVICE_CERTIFICATE1 / KEY_ATTESTATION - pair to communicate with the Honor services (useful in
+honor_ouc_check.py for example)
+
+## oeminfo_records.py
+
+Tool to pretty-print and modify values of unpacked oeminfo.
